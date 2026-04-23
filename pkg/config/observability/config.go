@@ -33,6 +33,8 @@ type Config struct {
 	Grafana string `json:"grafana" yaml:"grafana"`
 	// Prometheus is the url of prometheus
 	Prometheus string `json:"prometheus" yaml:"prometheus"`
+	// Logs is the config of logs
+	Logs *LogsConfig `json:"logs" yaml:"logs"`
 
 	GrafanaBaseURL    *url.URL `json:"-" yaml:"-"`
 	PrometheusBaseURL *url.URL `json:"-" yaml:"-"`
