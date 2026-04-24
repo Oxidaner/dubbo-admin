@@ -19,6 +19,8 @@ package context
 
 import (
 	ctx "context"
+
+	logprovider "github.com/apache/dubbo-admin/pkg/console/logs"
 	"github.com/apache/dubbo-admin/pkg/core/lock"
 
 	"github.com/apache/dubbo-admin/pkg/config/app"
@@ -30,6 +32,7 @@ import (
 type Context interface {
 	ResourceManager() manager.ResourceManager
 	CounterManager() counter.CounterManager
+	LogProvider() logprovider.Provider
 
 	Config() app.AdminConfig
 
@@ -72,6 +75,18 @@ func (c *context) CounterManager() counter.CounterManager {
 		return nil
 	}
 	return managerComp.CounterManager()
+}
+
+func (c *context) LogProvider() logprovider.Provider {
+	comp, err := c.coreRt.GetComponent(logprovider.ComponentType)
+	if err != nil {
+		return nil
+	}
+	providerComp, ok := comp.(logprovider.ProviderComponent)
+	if !ok {
+		return nil
+	}
+	return providerComp.LogProvider()
 }
 
 func (c *context) LockManager() lock.Lock {

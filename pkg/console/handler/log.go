@@ -11,7 +11,7 @@ import (
 	"github.com/apache/dubbo-admin/pkg/console/util"
 )
 
-func SearchLogs(ctx consolectx.Context, logSvc *service.LogService) gin.HandlerFunc {
+func SearchLogs(ctx consolectx.Context) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req model.SearchLogsReq
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -19,6 +19,7 @@ func SearchLogs(ctx consolectx.Context, logSvc *service.LogService) gin.HandlerF
 			return
 		}
 
+		logSvc := service.NewLogService(ctx.LogProvider())
 		resp, err := logSvc.SearchLogs(c.Request.Context(), &req)
 		if err != nil {
 			util.HandleServiceError(c, err)
@@ -28,7 +29,7 @@ func SearchLogs(ctx consolectx.Context, logSvc *service.LogService) gin.HandlerF
 	}
 }
 
-func AnalyzeErrorLogs(ctx consolectx.Context, logSvc *service.LogService) gin.HandlerFunc {
+func AnalyzeErrorLogs(ctx consolectx.Context) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req model.AnalyzeErrorLogsReq
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -36,6 +37,7 @@ func AnalyzeErrorLogs(ctx consolectx.Context, logSvc *service.LogService) gin.Ha
 			return
 		}
 
+		logSvc := service.NewLogService(ctx.LogProvider())
 		resp, err := logSvc.AnalyzeErrorLogs(c.Request.Context(), &req)
 		if err != nil {
 			util.HandleServiceError(c, err)

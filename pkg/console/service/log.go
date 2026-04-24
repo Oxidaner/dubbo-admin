@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	"github.com/apache/dubbo-admin/pkg/common/bizerror"
+	logprovider "github.com/apache/dubbo-admin/pkg/console/logs"
 	consolemodel "github.com/apache/dubbo-admin/pkg/console/model"
-	logprovider "github.com/apache/dubbo-admin/pkg/observability/logs"
 )
 
 type LogService struct {

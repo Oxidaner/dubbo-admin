@@ -134,6 +134,12 @@ func InitRouter(r *gin.Engine, ctx consolectx.Context) {
 		tagRule.DELETE("/:ruleName", handler.DeleteTagRuleWithRuleName(ctx))
 	}
 
+	{
+		logsGroup := router.Group("/logs")
+		logsGroup.POST("/search", handler.SearchLogs(ctx))
+		logsGroup.POST("/error-analysis", handler.AnalyzeErrorLogs(ctx))
+	}
+
 	router.GET("/prometheus", handler.GetPrometheus(ctx))
 	router.GET("/search", handler.BannerGlobalSearch(ctx))
 	router.GET("/overview", handler.ClusterOverview(ctx))
