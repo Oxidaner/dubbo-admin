@@ -54,8 +54,11 @@ func NewCredentials(resources manager.ResourceManager) (*Credentials, error) {
 }
 
 func (r *Credentials) Create(mesh, serverID, displayName string, expiresAt time.Time) (*meshresource.MCPCredentialResource, string, error) {
-	if mesh == "" || serverID == "" || strings.TrimSpace(displayName) == "" || !expiresAt.After(time.Now()) {
-		return nil, "", fmt.Errorf("mesh, server, display name and a future expiration are required")
+	if mesh == "" || serverID == "" || strings.TrimSpace(displayName) == "" {
+		return nil, "", fmt.Errorf("mesh, server and display name are required")
+	}
+	if !expiresAt.IsZero() && !expiresAt.After(time.Now()) {
+		return nil, "", fmt.Errorf("expiresAt must be a future expiration or zero for no expiration")
 	}
 	secretBytes := make([]byte, 32)
 	if _, err := rand.Read(secretBytes); err != nil {
@@ -70,7 +73,7 @@ func (r *Credentials) Create(mesh, serverID, displayName string, expiresAt time.
 		DisplayName: displayName,
 		SecretHash:  "sha256:" + hex.EncodeToString(digest[:]),
 		Status:      "active",
-		ExpiresAt:   expiresAt.UTC().Format(time.RFC3339),
+		ExpiresAt:   formatExpiration(expiresAt),
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	server := meshresource.NewMCPServerResourceWithAttributes(serverID, mesh)
@@ -115,11 +118,25 @@ func (r *Credentials) Authenticate(mesh, serverID, credentialID, secret string, 
 	if !exists || credential.Spec == nil {
 		return nil, fmt.Errorf("invalid MCP credential")
 	}
-	expiresAt, err := time.Parse(time.RFC3339, credential.Spec.ExpiresAt)
-	if err != nil || credential.Spec.ServerId != serverID || credential.Spec.Status != "active" || !now.Before(expiresAt) || !VerifySecretHash(credential.Spec.SecretHash, secret) {
+	expiresAt, err := parseExpiration(credential.Spec.ExpiresAt)
+	if err != nil || credential.Spec.ServerId != serverID || credential.Spec.Status != "active" || (!expiresAt.IsZero() && !now.Before(expiresAt)) || !VerifySecretHash(credential.Spec.SecretHash, secret) {
 		return nil, fmt.Errorf("invalid MCP credential")
 	}
 	return credential, nil
+}
+
+func formatExpiration(expiresAt time.Time) string {
+	if expiresAt.IsZero() {
+		return ""
+	}
+	return expiresAt.UTC().Format(time.RFC3339)
+}
+
+func parseExpiration(value string) (time.Time, error) {
+	if strings.TrimSpace(value) == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, value)
 }
 
 func VerifySecretHash(stored, secret string) bool {
