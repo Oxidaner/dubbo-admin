@@ -38,6 +38,7 @@ import (
 type Credentials struct {
 	resources   manager.ResourceManager
 	conditional manager.ConditionalResourceManager
+	dependent   manager.DependentResourceManager
 }
 
 func NewCredentials(resources manager.ResourceManager) (*Credentials, error) {
@@ -45,19 +46,16 @@ func NewCredentials(resources manager.ResourceManager) (*Credentials, error) {
 	if !ok {
 		return nil, fmt.Errorf("resource manager does not support conditional mutations")
 	}
-	return &Credentials{resources: resources, conditional: conditional}, nil
+	dependent, ok := resources.(manager.DependentResourceManager)
+	if !ok {
+		return nil, fmt.Errorf("resource manager does not support dependent creation")
+	}
+	return &Credentials{resources: resources, conditional: conditional, dependent: dependent}, nil
 }
 
 func (r *Credentials) Create(mesh, serverID, displayName string, expiresAt time.Time) (*meshresource.MCPCredentialResource, string, error) {
 	if mesh == "" || serverID == "" || strings.TrimSpace(displayName) == "" || !expiresAt.After(time.Now()) {
 		return nil, "", fmt.Errorf("mesh, server, display name and a future expiration are required")
-	}
-	_, exists, err := r.resources.GetByKey(meshresource.MCPServerKind, coremodel.BuildResourceKey(mesh, serverID))
-	if err != nil {
-		return nil, "", err
-	}
-	if !exists {
-		return nil, "", fmt.Errorf("MCP server %q not found", serverID)
 	}
 	secretBytes := make([]byte, 32)
 	if _, err := rand.Read(secretBytes); err != nil {
@@ -75,7 +73,8 @@ func (r *Credentials) Create(mesh, serverID, displayName string, expiresAt time.
 		ExpiresAt:   expiresAt.UTC().Format(time.RFC3339),
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if err := r.resources.Add(credential); err != nil {
+	server := meshresource.NewMCPServerResourceWithAttributes(serverID, mesh)
+	if err := r.dependent.AddWithParent(server, credential); err != nil {
 		return nil, "", err
 	}
 	return credential, "mcp_" + credentialID + "." + secret, nil
@@ -103,6 +102,24 @@ func (r *Credentials) Revoke(mesh, serverID, credentialID, expectedVersion strin
 		return nil, err
 	}
 	return updated, nil
+}
+
+// Authenticate always reads the authoritative store, so a revoke made by
+// another replica takes effect on the next authentication attempt.
+func (r *Credentials) Authenticate(mesh, serverID, credentialID, secret string, now time.Time) (*meshresource.MCPCredentialResource, error) {
+	credential, exists, err := manager.GetByKey[*meshresource.MCPCredentialResource](
+		r.resources, meshresource.MCPCredentialKind, coremodel.BuildResourceKey(mesh, credentialID))
+	if err != nil {
+		return nil, err
+	}
+	if !exists || credential.Spec == nil {
+		return nil, fmt.Errorf("invalid MCP credential")
+	}
+	expiresAt, err := time.Parse(time.RFC3339, credential.Spec.ExpiresAt)
+	if err != nil || credential.Spec.ServerId != serverID || credential.Spec.Status != "active" || !now.Before(expiresAt) || !VerifySecretHash(credential.Spec.SecretHash, secret) {
+		return nil, fmt.Errorf("invalid MCP credential")
+	}
+	return credential, nil
 }
 
 func VerifySecretHash(stored, secret string) bool {

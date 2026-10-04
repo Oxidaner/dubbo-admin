@@ -65,6 +65,14 @@ type ConditionalResourceManager interface {
 	CompareAndDelete(r model.Resource, expectedVersion string) error
 }
 
+type CascadingResourceManager interface {
+	CompareAndDeleteWithDependents(r model.Resource, expectedVersion string, dependentKind model.ResourceKind, conditions []index.IndexCondition) error
+}
+
+type DependentResourceManager interface {
+	AddWithParent(parent model.Resource, child model.Resource) error
+}
+
 var _ ResourceManager = &resourcesManager{}
 
 type resourcesManager struct {
@@ -221,4 +229,39 @@ func (rm *resourcesManager) CompareAndDelete(r model.Resource, expectedVersion s
 		return fmt.Errorf("resource store for %s does not support conditional mutations", r.ResourceKind())
 	}
 	return conditional.CompareAndDelete(r, expectedVersion)
+}
+
+func (rm *resourcesManager) CompareAndDeleteWithDependents(r model.Resource, expectedVersion string, dependentKind model.ResourceKind, conditions []index.IndexCondition) error {
+	if !store.IsVersionedResourceKind(r.ResourceKind()) || !store.IsVersionedResourceKind(dependentKind) {
+		return bizerror.New(bizerror.InvalidArgument, "resources do not support cascading conditional mutations")
+	}
+	parent, err := rm.storeRouter.ResourceRoute(r)
+	if err != nil {
+		return err
+	}
+	dependents, err := rm.storeRouter.ResourceKindRoute(dependentKind)
+	if err != nil {
+		return err
+	}
+	cascading, ok := parent.(store.CascadingResourceStore)
+	if !ok {
+		return fmt.Errorf("resource store for %s does not support cascading mutations", r.ResourceKind())
+	}
+	return cascading.CompareAndDeleteWithDependents(r, expectedVersion, dependents, conditions)
+}
+
+func (rm *resourcesManager) AddWithParent(parent model.Resource, child model.Resource) error {
+	parentStore, err := rm.storeRouter.ResourceRoute(parent)
+	if err != nil {
+		return err
+	}
+	childStore, err := rm.storeRouter.ResourceRoute(child)
+	if err != nil {
+		return err
+	}
+	dependent, ok := childStore.(store.DependentResourceStore)
+	if !ok {
+		return fmt.Errorf("resource store for %s does not support dependent creation", child.ResourceKind())
+	}
+	return dependent.AddWithParent(parent, parentStore, child)
 }

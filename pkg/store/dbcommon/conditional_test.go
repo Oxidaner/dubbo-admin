@@ -30,6 +30,7 @@ import (
 	storecfg "github.com/apache/dubbo-admin/pkg/config/store"
 	meshresource "github.com/apache/dubbo-admin/pkg/core/resource/apis/mesh/v1alpha1"
 	"github.com/apache/dubbo-admin/pkg/core/store"
+	"github.com/apache/dubbo-admin/pkg/core/store/index"
 )
 
 func setupConditionalStore(t *testing.T) *GormStore {
@@ -121,6 +122,84 @@ func TestGormCredentialRevokeDoesNotAffectOtherCredentials(t *testing.T) {
 	require.True(t, exists)
 	require.Equal(t, "1", item.(*meshresource.MCPCredentialResource).ResourceVersion)
 	require.Empty(t, item.(*meshresource.MCPCredentialResource).Spec.Status)
+}
+
+func TestGormVersionedReadsAcrossStoreInstances(t *testing.T) {
+	serverA := setupConditionalStore(t)
+	serverB := NewGormStore(meshresource.MCPServerKind, t.Name()+"-server-b", serverA.pool)
+	require.NoError(t, serverB.Init(nil))
+	credentialA := NewGormStore(meshresource.MCPCredentialKind, t.Name()+"-credential-a", serverA.pool)
+	credentialB := NewGormStore(meshresource.MCPCredentialKind, t.Name()+"-credential-b", serverA.pool)
+	require.NoError(t, credentialA.Init(nil))
+	require.NoError(t, credentialB.Init(nil))
+
+	server := meshresource.NewMCPServerResourceWithAttributes("server-1", "mesh-1")
+	require.NoError(t, serverA.Add(server))
+	first := server.DeepCopyObject().(*meshresource.MCPServerResource)
+	first.Spec.Draft = &meshproto.MCPServerSnapshot{Description: "first publish"}
+	require.NoError(t, serverA.CompareAndSwap(first, "1"))
+	stale := server.DeepCopyObject().(*meshresource.MCPServerResource)
+	require.ErrorIs(t, serverB.CompareAndSwap(stale, "1"), store.ErrorResourceConflict("", "", ""))
+
+	credential := meshresource.NewMCPCredentialResourceWithAttributes("credential-1", "mesh-1")
+	credential.Spec.ServerId = "server-1"
+	credential.Spec.Status = "active"
+	require.NoError(t, credentialA.Add(credential))
+	seenOnB, exists, err := credentialB.GetByKey(credential.ResourceKey())
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, "active", seenOnB.(*meshresource.MCPCredentialResource).Spec.Status)
+	revoked := credential.DeepCopyObject().(*meshresource.MCPCredentialResource)
+	revoked.Spec.Status = "revoked"
+	require.NoError(t, credentialA.CompareAndSwap(revoked, "1"))
+	seenOnB, exists, err = credentialB.GetByKey(credential.ResourceKey())
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, "revoked", seenOnB.(*meshresource.MCPCredentialResource).Spec.Status)
+	require.Equal(t, "2", seenOnB.(*meshresource.MCPCredentialResource).ResourceVersion)
+
+	second := meshresource.NewMCPCredentialResourceWithAttributes("credential-2", "mesh-1")
+	second.Spec.ServerId = "server-1"
+	require.NoError(t, credentialA.Add(second))
+	listed, err := credentialB.GetByKeys([]string{second.ResourceKey(), credential.ResourceKey()})
+	require.NoError(t, err)
+	require.Len(t, listed, 2)
+	require.Equal(t, second.ResourceKey(), listed[0].ResourceKey())
+	require.Equal(t, credential.ResourceKey(), listed[1].ResourceKey())
+}
+
+func TestGormServerDeleteCascadesCredentials(t *testing.T) {
+	server := setupConditionalStore(t)
+	credentials := NewGormStore(meshresource.MCPCredentialKind, t.Name()+"-credentials", server.pool)
+	require.NoError(t, credentials.Init(nil))
+	first := meshresource.NewMCPServerResourceWithAttributes("first", "mesh-1")
+	other := meshresource.NewMCPServerResourceWithAttributes("other", "mesh-1")
+	require.NoError(t, server.Add(first))
+	require.NoError(t, server.Add(other))
+	for _, id := range []string{"one", "two"} {
+		credential := meshresource.NewMCPCredentialResourceWithAttributes(id, "mesh-1")
+		credential.Spec.ServerId = "first"
+		require.NoError(t, credentials.AddWithParent(first, server, credential))
+	}
+	kept := meshresource.NewMCPCredentialResourceWithAttributes("kept", "mesh-1")
+	kept.Spec.ServerId = "other"
+	require.NoError(t, credentials.AddWithParent(other, server, kept))
+	conditions := []index.IndexCondition{
+		{IndexName: index.ByMeshIndex, Value: "mesh-1", Operator: index.Equals},
+		{IndexName: index.ByMCPCredentialServerID, Value: "first", Operator: index.Equals},
+	}
+	require.ErrorIs(t, server.CompareAndDeleteWithDependents(first, "2", credentials, conditions), store.ErrorResourceConflict("", "", ""))
+	require.NoError(t, server.CompareAndDeleteWithDependents(first, "1", credentials, conditions))
+	removed, err := credentials.ListByIndexes(conditions)
+	require.NoError(t, err)
+	require.Empty(t, removed)
+	item, exists, err := credentials.GetByKey(kept.ResourceKey())
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, "other", item.(*meshresource.MCPCredentialResource).Spec.ServerId)
+	late := meshresource.NewMCPCredentialResourceWithAttributes("late", "mesh-1")
+	late.Spec.ServerId = "first"
+	require.Error(t, credentials.AddWithParent(first, server, late))
 }
 
 func hasSQLiteColumn(t *testing.T, managed *GormStore, table, name string) bool {

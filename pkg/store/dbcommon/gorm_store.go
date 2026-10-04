@@ -26,6 +26,7 @@ import (
 	"sync"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/apache/dubbo-admin/pkg/common/bizerror"
@@ -50,6 +51,8 @@ type GormStore struct {
 
 var _ store.ManagedResourceStore = &GormStore{}
 var _ store.ConditionalResourceStore = &GormStore{}
+var _ store.CascadingResourceStore = &GormStore{}
+var _ store.DependentResourceStore = &GormStore{}
 
 // NewGormStore creates a new GORM store for the specified resource kind
 func NewGormStore(kind model.ResourceKind, address string, pool *ConnectionPool) *GormStore {
@@ -178,6 +181,40 @@ func (gs *GormStore) Add(obj interface{}) error {
 		if versioned, ok := obj.(store.VersionedResource); ok {
 			versioned.SetResourceVersion(resource.ResourceMeta().ResourceVersion)
 		}
+	}
+	return err
+}
+
+func (gs *GormStore) AddWithParent(parent model.Resource, parentStore store.ResourceStore, child model.Resource) error {
+	serverStore, ok := parentStore.(*GormStore)
+	if !ok || serverStore.pool != gs.pool || child.ResourceKind() != gs.kind || parent.ResourceKind() != serverStore.kind {
+		return &store.PreconditionError{Reason: "parent and dependent must share a Gorm connection pool"}
+	}
+	candidate := child.DeepCopyObject().(model.Resource)
+	if err := store.PrepareInitialVersion(candidate); err != nil {
+		return err
+	}
+	m, err := FromResource(candidate)
+	if err != nil {
+		return err
+	}
+	err = gs.pool.GetDB().Transaction(func(tx *gorm.DB) error {
+		var server VersionedResourceModel
+		err := tx.Scopes(TableScope(serverStore.kind.ToString())).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("resource_key = ?", parent.ResourceKey()).First(&server).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return store.ErrorResourceNotFound(parent.ResourceKind().ToString(), parent.ResourceMeta().Name, parent.ResourceMesh())
+		}
+		if err != nil {
+			return err
+		}
+		if err := tx.Scopes(TableScope(gs.kind.ToString())).Create(&VersionedResourceModel{ResourceModel: *m, Version: 1}).Error; err != nil {
+			return err
+		}
+		return gs.persistIndexEntriesTx(tx, candidate, nil)
+	})
+	if err == nil {
+		child.(store.VersionedResource).SetResourceVersion(candidate.ResourceMeta().ResourceVersion)
 	}
 	return err
 }
@@ -375,6 +412,62 @@ func (gs *GormStore) CompareAndDelete(obj model.Resource, expectedVersion string
 		}
 		return tx.Where("resource_kind = ? AND resource_key = ?", gs.kind.ToString(), obj.ResourceKey()).
 			Delete(&ResourceIndexModel{}).Error
+	})
+}
+
+func (gs *GormStore) CompareAndDeleteWithDependents(obj model.Resource, expectedVersion string, dependents store.ResourceStore, conditions []index.IndexCondition) error {
+	childStore, ok := dependents.(*GormStore)
+	if !ok || childStore.pool != gs.pool || childStore == gs || obj.ResourceKind() != gs.kind {
+		return &store.PreconditionError{Reason: "parent and dependent must use distinct Gorm stores sharing one connection pool"}
+	}
+	if len(conditions) != 2 || conditions[0].IndexName != index.ByMeshIndex || conditions[0].Value != obj.ResourceMesh() || conditions[1].IndexName != index.ByMCPCredentialServerID || conditions[1].Value != obj.ResourceMeta().Name {
+		return &store.PreconditionError{Reason: "dependent query must be scoped to server mesh and ID"}
+	}
+	if _, err := store.NextResourceVersion(obj, expectedVersion); err != nil {
+		return err
+	}
+	expected, _ := strconv.ParseUint(expectedVersion, 10, 64)
+	return gs.pool.GetDB().Transaction(func(tx *gorm.DB) error {
+		var current VersionedResourceModel
+		err := tx.Scopes(TableScope(gs.kind.ToString())).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("resource_key = ?", obj.ResourceKey()).First(&current).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return store.ErrorResourceNotFound(obj.ResourceKind().ToString(), obj.ResourceMeta().Name, obj.ResourceMesh())
+		}
+		if err != nil {
+			return err
+		}
+		if current.Version != expected {
+			return store.ErrorResourceConflict(obj.ResourceKind().ToString(), obj.ResourceMeta().Name, obj.ResourceMesh())
+		}
+		var children []VersionedResourceModel
+		keysQuery := tx.Model(&ResourceIndexModel{}).Select("resource_key").Where(
+			"resource_kind = ? AND index_name = ? AND index_value = ?", childStore.kind.ToString(), index.ByMCPCredentialServerID, obj.ResourceMeta().Name)
+		if err := tx.Scopes(TableScope(childStore.kind.ToString())).Where("mesh = ? AND resource_key IN (?)", obj.ResourceMesh(), keysQuery).
+			Find(&children).Error; err != nil {
+			return err
+		}
+		if len(children) > 0 {
+			keys := make([]string, len(children))
+			for i := range children {
+				keys[i] = children[i].ResourceKey
+			}
+			if err := tx.Scopes(TableScope(childStore.kind.ToString())).Where("resource_key IN ?", keys).Delete(&VersionedResourceModel{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("resource_kind = ? AND resource_key IN ?", childStore.kind.ToString(), keys).Delete(&ResourceIndexModel{}).Error; err != nil {
+				return err
+			}
+		}
+		result := tx.Scopes(TableScope(gs.kind.ToString())).Where("resource_key = ? AND version = ?", obj.ResourceKey(), expected).
+			Delete(&VersionedResourceModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return store.ErrorResourceConflict(obj.ResourceKind().ToString(), obj.ResourceMeta().Name, obj.ResourceMesh())
+		}
+		return tx.Where("resource_kind = ? AND resource_key = ?", gs.kind.ToString(), obj.ResourceKey()).Delete(&ResourceIndexModel{}).Error
 	})
 }
 
@@ -657,12 +750,18 @@ func (gs *GormStore) GetByKeys(keys []string) ([]model.Resource, error) {
 			Where("resource_key IN ?", keys).Find(&models).Error; err != nil {
 			return nil, err
 		}
+		byKey := make(map[string]model.Resource, len(models))
 		for _, m := range models {
 			resource, err := m.ResourceModel.ToResourceWithVersion(m.Version)
 			if err != nil {
 				return nil, err
 			}
-			resources = append(resources, resource)
+			byKey[m.ResourceKey] = resource
+		}
+		for _, key := range keys {
+			if resource, ok := byKey[key]; ok {
+				resources = append(resources, resource)
+			}
 		}
 		return resources, nil
 	}

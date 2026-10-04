@@ -74,6 +74,12 @@ func TestCredentialLifecycle(t *testing.T) {
 	require.True(t, VerifySecretHash(first.Spec.SecretHash, secret))
 	require.False(t, VerifySecretHash(first.Spec.SecretHash, "incorrect"))
 	require.False(t, VerifySecretHash(strings.TrimPrefix(first.Spec.SecretHash, "sha256:"), secret))
+	_, err = repo.Authenticate("mesh-1", "server-1", first.Name, secret, time.Now())
+	require.NoError(t, err)
+	_, err = repo.Authenticate("mesh-1", "different-server", first.Name, secret, time.Now())
+	require.Error(t, err)
+	_, err = repo.Authenticate("mesh-1", "server-1", first.Name, secret, time.Now().Add(2*time.Hour))
+	require.Error(t, err)
 
 	listed, err := repo.List("mesh-1", "server-1")
 	require.NoError(t, err)
@@ -88,6 +94,8 @@ func TestCredentialLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "revoked", revoked.Spec.Status)
 	require.Equal(t, "2", revoked.ResourceVersion)
+	_, err = repo.Authenticate("mesh-1", "server-1", first.Name, secret, time.Now())
+	require.Error(t, err)
 	_, err = repo.Revoke("mesh-1", "server-1", first.Name, "1")
 	require.True(t, errors.Is(err, store.ErrorResourceConflict("", "", "")))
 }
