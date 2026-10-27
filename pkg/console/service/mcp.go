@@ -278,25 +278,12 @@ func PublishMCPServer(ctx consolectx.Context, mesh, serverID string, req *model.
 func validateMCPProtocolEvidence(ctx consolectx.Context, mesh string, snapshot *meshproto.MCPServerSnapshot) ([]model.MCPValidationIssue, []model.MCPValidationIssue, error) {
 	validationErrors := make([]model.MCPValidationIssue, 0)
 	warnings := make([]model.MCPValidationIssue, 0)
-	metadata, err := manager.ListByIndexes[*meshresource.ServiceProviderMetadataResource](
-		ctx.ResourceManager(), meshresource.ServiceProviderMetadataKind,
-		[]index.IndexCondition{{IndexName: index.ByMeshIndex, Value: mesh, Operator: index.Equals}},
-	)
+	source, _ := ctx.(availability.SyncStateSource)
+	evidence, err := availability.ReadSnapshot(ctx.ResourceManager(), source, mesh)
 	if err != nil {
 		return nil, nil, err
 	}
-	instances, err := manager.ListByIndexes[*meshresource.RPCInstanceResource](
-		ctx.ResourceManager(), meshresource.RPCInstanceKind,
-		[]index.IndexCondition{{IndexName: index.ByMeshIndex, Value: mesh, Operator: index.Equals}},
-	)
-	if err != nil {
-		return nil, nil, err
-	}
-	evidence := availability.Snapshot{
-		Providers: metadata,
-		Instances: instances,
-		Sync:      availability.SyncState{InitialSyncComplete: true, Healthy: true},
-	}
+	syncState := evidence.Sync
 	for _, tool := range snapshot.Tools {
 		if tool == nil || tool.Operation == nil {
 			continue
@@ -311,6 +298,15 @@ func validateMCPProtocolEvidence(ctx consolectx.Context, mesh string, snapshot *
 				Code: "ProtocolIncompatible",
 				Message: fmt.Sprintf("service %s has available providers, but none support protocol %q",
 					tool.Operation.ServiceName, tool.Operation.Protocol),
+				ToolID: tool.ToolId,
+			})
+			continue
+		}
+		if !syncState.InitialSyncComplete || !syncState.Healthy {
+			warnings = append(warnings, model.MCPValidationIssue{
+				Code: "DiscoveryIncomplete",
+				Message: fmt.Sprintf("service %s discovery is not synchronized; protocol compatibility cannot be confirmed",
+					tool.Operation.ServiceName),
 				ToolID: tool.ToolId,
 			})
 			continue

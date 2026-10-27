@@ -31,6 +31,7 @@ import (
 	consolectx "github.com/apache/dubbo-admin/pkg/console/context"
 	"github.com/apache/dubbo-admin/pkg/console/counter"
 	"github.com/apache/dubbo-admin/pkg/console/model"
+	"github.com/apache/dubbo-admin/pkg/core/discovery"
 	"github.com/apache/dubbo-admin/pkg/core/lock"
 	"github.com/apache/dubbo-admin/pkg/core/manager"
 	meshresource "github.com/apache/dubbo-admin/pkg/core/resource/apis/mesh/v1alpha1"
@@ -58,6 +59,7 @@ func (r mcpServiceTestRouter) ResourceKindRoute(kind coremodel.ResourceKind) (st
 
 type mcpServiceTestContext struct {
 	resourceManager manager.ResourceManager
+	syncState       *discovery.SyncState
 }
 
 var _ consolectx.Context = (*mcpServiceTestContext)(nil)
@@ -86,6 +88,13 @@ func (*mcpServiceTestContext) RuleVersioning() *versioning.Service {
 	return nil
 }
 
+func (c *mcpServiceTestContext) DiscoverySyncState(string) discovery.SyncState {
+	if c.syncState != nil {
+		return *c.syncState
+	}
+	return discovery.SyncState{InitialSyncComplete: true, Healthy: true}
+}
+
 func newMCPServiceTestContext(t *testing.T, unavailable bool) (*mcpServiceTestContext, *meshresource.MCPServerResource) {
 	t.Helper()
 	kinds := []coremodel.ResourceKind{
@@ -93,6 +102,7 @@ func newMCPServiceTestContext(t *testing.T, unavailable bool) (*mcpServiceTestCo
 		meshresource.MCPCredentialKind,
 		meshresource.ServiceProviderMetadataKind,
 		meshresource.RPCInstanceKind,
+		meshresource.RPCInstanceMetadataKind,
 	}
 	stores := make(map[coremodel.ResourceKind]store.ResourceStore, len(kinds))
 	for _, kind := range kinds {
@@ -113,6 +123,7 @@ func newMCPServiceTestContext(t *testing.T, unavailable bool) (*mcpServiceTestCo
 	instance := meshresource.NewRPCInstanceResourceWithAttributes("instance-1", "mesh-1")
 	instance.Spec = &meshproto.RPCInstance{
 		AppName:   "orders-app",
+		Revision:  "r1",
 		Protocol:  "tri",
 		Endpoints: []*meshproto.Endpoint{{Protocol: "tri"}},
 	}
@@ -120,6 +131,12 @@ func newMCPServiceTestContext(t *testing.T, unavailable bool) (*mcpServiceTestCo
 		instance.Spec.UnregisterTime = "down"
 	}
 	require.NoError(t, stores[meshresource.RPCInstanceKind].Add(instance))
+
+	metadata := meshresource.NewRPCInstanceMetadataResourceWithAttributes("orders-app@r1", "mesh-1")
+	metadata.Spec = &meshproto.RPCInstanceMetadata{App: "orders-app", Revision: "r1", Services: map[string]*meshproto.ServiceInfo{
+		"com.example.OrderService:tri": {Name: "com.example.OrderService", Protocol: "tri"},
+	}}
+	require.NoError(t, stores[meshresource.RPCInstanceMetadataKind].Add(metadata))
 
 	server := meshresource.NewMCPServerResourceWithAttributes("server-1", "mesh-1")
 	server.Spec = &meshproto.MCPServer{
@@ -211,6 +228,25 @@ func TestMCPProtocolValidation(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "2", published.ResourceVersion)
 		require.Equal(t, int64(8), published.Spec.Published.Revision)
+	})
+
+	t.Run("initial synchronization and discovery outage are warnings", func(t *testing.T) {
+		for _, state := range []discovery.SyncState{
+			{InitialSyncComplete: false, Healthy: true},
+			{InitialSyncComplete: true, Healthy: false},
+		} {
+			ctx, server := newMCPServiceTestContext(t, false)
+			ctx.syncState = &state
+			validation, err := ValidateMCPServer(ctx, "mesh-1", "server-1")
+			require.NoError(t, err)
+			require.True(t, validation.Valid)
+			require.Equal(t, "DiscoveryIncomplete", validation.Warnings[0].Code)
+
+			_, err = PublishMCPServer(ctx, "mesh-1", "server-1", &model.MCPPublishReq{
+				ExpectedResourceVersion: server.ResourceVersion,
+			})
+			require.NoError(t, err)
+		}
 	})
 }
 

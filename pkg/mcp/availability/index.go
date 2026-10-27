@@ -24,6 +24,7 @@ import (
 	"time"
 
 	meshproto "github.com/apache/dubbo-admin/api/mesh/v1alpha1"
+	"github.com/apache/dubbo-admin/pkg/core/discovery"
 	meshresource "github.com/apache/dubbo-admin/pkg/core/resource/apis/mesh/v1alpha1"
 )
 
@@ -42,10 +43,7 @@ type Identity struct {
 	Version     string
 }
 
-type SyncState struct {
-	InitialSyncComplete bool
-	Healthy             bool
-}
+type SyncState = discovery.SyncState
 
 type Evidence struct {
 	Complete  bool
@@ -62,11 +60,14 @@ type Result struct {
 }
 
 type Snapshot struct {
-	Services  []*meshresource.ServiceResource
-	Providers []*meshresource.ServiceProviderMetadataResource
-	Instances []*meshresource.RPCInstanceResource
-	Sync      SyncState
-	Now       time.Time
+	// Identities includes published bindings even after their discovery Resources disappear.
+	Identities []Identity
+	Services   []*meshresource.ServiceResource
+	Providers  []*meshresource.ServiceProviderMetadataResource
+	Instances  []*meshresource.RPCInstanceResource
+	Metadata   []*meshresource.RPCInstanceMetadataResource
+	Sync       SyncState
+	Now        time.Time
 }
 
 type LiveServiceIndex struct {
@@ -88,6 +89,9 @@ func (i *LiveServiceIndex) Refresh(snapshot Snapshot) []Result {
 		now = time.Now()
 	}
 	identities := make(map[Identity]struct{})
+	for _, identity := range snapshot.Identities {
+		identities[identity] = struct{}{}
+	}
 	for _, service := range snapshot.Services {
 		if service != nil && service.Spec != nil {
 			identities[Identity{
@@ -105,19 +109,18 @@ func (i *LiveServiceIndex) Refresh(snapshot Snapshot) []Result {
 		}
 	}
 
-	next := make(map[string]Result)
 	i.mu.Lock()
-	previousItems := make(map[string]Result, len(i.items))
-	for key, value := range i.items {
-		previousItems[key] = value
+	defer i.mu.Unlock()
+	for _, previous := range i.items {
+		identities[previous.Identity] = struct{}{}
 	}
-	i.mu.Unlock()
+	next := make(map[string]Result)
 	for identity := range identities {
-		for _, protocol := range protocolsForIdentity(identity, snapshot.Providers, snapshot.Instances) {
+		for _, protocol := range []string{"dubbo", "tri"} {
 			result := evaluate(identity, protocol, snapshot)
 			key := resultKey(identity, protocol)
 			if result.State == Inactive {
-				if previous, ok := previousItems[key]; ok && !previous.InactiveSince.IsZero() {
+				if previous, ok := i.items[key]; ok && previous.State == Inactive {
 					result.InactiveSince = previous.InactiveSince
 				} else {
 					result.InactiveSince = now
@@ -127,9 +130,7 @@ func (i *LiveServiceIndex) Refresh(snapshot Snapshot) []Result {
 		}
 	}
 
-	i.mu.Lock()
 	i.items = next
-	i.mu.Unlock()
 
 	results := make([]Result, 0, len(next))
 	for _, result := range next {
@@ -140,6 +141,37 @@ func (i *LiveServiceIndex) Refresh(snapshot Snapshot) []Result {
 			resultKey(results[b].Identity, results[b].Protocol)
 	})
 	return results
+}
+
+// FilterTools applies availability to a current published tool list. Call it on
+// every tools/list, including when the compiled handler is cached.
+func (i *LiveServiceIndex) FilterTools(mesh string, tools []*meshproto.MCPToolBinding, snapshot Snapshot) []*meshproto.MCPToolBinding {
+	for _, tool := range tools {
+		if tool != nil && tool.Operation != nil {
+			snapshot.Identities = append(snapshot.Identities, Identity{
+				Mesh: mesh, ServiceName: tool.Operation.ServiceName,
+				Group: tool.Operation.Group, Version: tool.Operation.Version,
+			})
+		}
+	}
+	results := make(map[string]Result)
+	for _, result := range i.Refresh(snapshot) {
+		results[resultKey(result.Identity, result.Protocol)] = result
+	}
+	visible := make([]*meshproto.MCPToolBinding, 0, len(tools))
+	for _, tool := range tools {
+		if tool == nil || tool.Operation == nil {
+			continue
+		}
+		identity := Identity{
+			Mesh: mesh, ServiceName: tool.Operation.ServiceName,
+			Group: tool.Operation.Group, Version: tool.Operation.Version,
+		}
+		if i.Visible(results[resultKey(identity, tool.Operation.Protocol)], snapshot.Now) {
+			visible = append(visible, tool)
+		}
+	}
+	return visible
 }
 
 func (i *LiveServiceIndex) Get(identity Identity, protocol string) (Result, bool) {
@@ -185,74 +217,75 @@ func evaluate(identity Identity, protocol string, snapshot Snapshot) Result {
 	if !snapshot.Sync.InitialSyncComplete || !snapshot.Sync.Healthy {
 		return result
 	}
-
-	for _, provider := range snapshot.Providers {
-		if provider == nil || provider.Spec == nil ||
-			provider.Mesh != identity.Mesh ||
-			provider.Spec.ServiceName != identity.ServiceName ||
-			provider.Spec.Group != identity.Group ||
-			provider.Spec.Version != identity.Version {
-			continue
-		}
-		for _, instance := range snapshot.Instances {
-			if instance == nil || instance.Spec == nil ||
-				instance.Mesh != identity.Mesh ||
-				instance.Spec.AppName != provider.Spec.ProviderAppName ||
-				instance.Spec.UnregisterTime != "" ||
-				!supportsProtocol(instance.Spec.Protocol, instance.Spec.Endpoints, protocol) {
-				continue
+	if result.Evidence.Available {
+		for _, availableProtocol := range result.Evidence.Protocols {
+			if availableProtocol == protocol {
+				result.State = Active
+				return result
 			}
-			result.State = Active
-			return result
 		}
 	}
-	result.State = Inactive
+	if result.Evidence.Complete {
+		result.State = Inactive
+	}
 	return result
 }
 
 func protocolEvidence(identity Identity, snapshot Snapshot) Evidence {
-	result := Evidence{}
-	providerApps := make(map[string]struct{})
 	protocols := make(map[string]struct{})
 	complete := snapshot.Sync.InitialSyncComplete && snapshot.Sync.Healthy
-	available := false
-	for _, provider := range snapshot.Providers {
-		if provider == nil || provider.Spec == nil ||
-			provider.Mesh != identity.Mesh ||
-			provider.Spec.ServiceName != identity.ServiceName ||
-			provider.Spec.Group != identity.Group ||
-			provider.Spec.Version != identity.Version {
-			continue
-		}
-		providerApps[provider.Spec.ProviderAppName] = struct{}{}
-	}
-	if len(providerApps) == 0 {
-		return result
-	}
-	seenApps := make(map[string]struct{})
+	result := Evidence{}
 	for _, instance := range snapshot.Instances {
 		if instance == nil || instance.Spec == nil || instance.Mesh != identity.Mesh {
 			continue
 		}
-		if _, ok := providerApps[instance.Spec.AppName]; !ok {
+		if instance.Spec.UnregisterTime != "" || (instance.Spec.Available != nil && !*instance.Spec.Available) {
 			continue
 		}
-		if instance.Spec.UnregisterTime != "" {
+		exports, known := exportsForInstance(instance, snapshot.Metadata)
+		if !known {
+			complete = false
 			continue
 		}
-		available = true
-		seenApps[instance.Spec.AppName] = struct{}{}
-		for value := range instanceProtocols(instance.Spec.Protocol, instance.Spec.Endpoints) {
-			protocols[value] = struct{}{}
+		for _, export := range exports {
+			if export == nil || export.Name != identity.ServiceName ||
+				export.Group != identity.Group || export.Version != identity.Version {
+				continue
+			}
+			result.Available = true
+			if value := strings.TrimSpace(export.Protocol); value != "" {
+				protocols[value] = struct{}{}
+			} else {
+				complete = false
+			}
 		}
 	}
-	for app := range providerApps {
-		if _, ok := seenApps[app]; !ok {
+	for _, registration := range snapshot.Metadata {
+		if registration == nil || registration.Spec == nil ||
+			registration.Mesh != identity.Mesh || registration.Spec.InstanceName == "" {
+			continue
+		}
+		if registration.Spec.Available == nil {
 			complete = false
+			continue
+		}
+		if !*registration.Spec.Available {
+			continue
+		}
+		for _, export := range registration.Spec.Services {
+			if export == nil || export.Name != identity.ServiceName ||
+				export.Group != identity.Group || export.Version != identity.Version {
+				continue
+			}
+			result.Available = true
+			if value := strings.TrimSpace(export.Protocol); value != "" {
+				protocols[value] = struct{}{}
+			} else {
+				complete = false
+			}
 		}
 	}
 	result.Complete = complete
-	result.Available = available
 	for protocol := range protocols {
 		result.Protocols = append(result.Protocols, protocol)
 	}
@@ -260,47 +293,25 @@ func protocolEvidence(identity Identity, snapshot Snapshot) Evidence {
 	return result
 }
 
-func protocolsForIdentity(identity Identity, providers []*meshresource.ServiceProviderMetadataResource, instances []*meshresource.RPCInstanceResource) []string {
-	set := map[string]struct{}{"dubbo": {}, "tri": {}}
-	for _, provider := range providers {
-		if provider == nil || provider.Spec == nil || provider.Mesh != identity.Mesh ||
-			provider.Spec.ServiceName != identity.ServiceName || provider.Spec.Group != identity.Group ||
-			provider.Spec.Version != identity.Version {
+func exportsForInstance(
+	instance *meshresource.RPCInstanceResource,
+	metadata []*meshresource.RPCInstanceMetadataResource,
+) ([]*meshproto.ServiceInfo, bool) {
+	if instance.Spec.Revision == "" {
+		return nil, false
+	}
+	for _, item := range metadata {
+		if item == nil || item.Spec == nil || item.Mesh != instance.Mesh ||
+			item.Spec.App != instance.Spec.AppName || item.Spec.Revision != instance.Spec.Revision {
 			continue
 		}
-		for _, instance := range instances {
-			if instance != nil && instance.Spec != nil && instance.Mesh == identity.Mesh &&
-				instance.Spec.AppName == provider.Spec.ProviderAppName {
-				for protocol := range instanceProtocols(instance.Spec.Protocol, instance.Spec.Endpoints) {
-					set[protocol] = struct{}{}
-				}
-			}
+		exports := make([]*meshproto.ServiceInfo, 0, len(item.Spec.Services))
+		for _, service := range item.Spec.Services {
+			exports = append(exports, service)
 		}
+		return exports, true
 	}
-	result := make([]string, 0, len(set))
-	for protocol := range set {
-		result = append(result, protocol)
-	}
-	sort.Strings(result)
-	return result
-}
-
-func supportsProtocol(primary string, endpoints []*meshproto.Endpoint, selected string) bool {
-	_, ok := instanceProtocols(primary, endpoints)[selected]
-	return ok
-}
-
-func instanceProtocols(primary string, endpoints []*meshproto.Endpoint) map[string]struct{} {
-	result := make(map[string]struct{})
-	if value := strings.TrimSpace(primary); value != "" {
-		result[value] = struct{}{}
-	}
-	for _, endpoint := range endpoints {
-		if endpoint != nil && strings.TrimSpace(endpoint.Protocol) != "" {
-			result[endpoint.Protocol] = struct{}{}
-		}
-	}
-	return result
+	return nil, false
 }
 
 func resultKey(identity Identity, protocol string) string {
