@@ -136,6 +136,27 @@ func InitRouter(r *gin.Engine, ctx consolectx.Context) {
 		tagRule.DELETE("/:ruleName", handler.DeleteTagRuleWithRuleName(ctx))
 	}
 
+	{
+		mcp := router.Group("/mcp/servers")
+		mcp.GET("", handler.RequireMCPMesh(), handler.ListMCPServers(ctx))
+		mcp.POST("", handler.CreateMCPServer(ctx))
+		mcp.Use(handler.RequireMCPMesh())
+		mcp.GET("/:serverId", handler.RequireMCPMesh(), handler.GetMCPServer(ctx))
+		mcp.DELETE("/:serverId", handler.DeleteMCPServer(ctx))
+		mcp.PUT("/:serverId/draft", handler.ReplaceMCPDraft(ctx))
+		mcp.POST("/:serverId/validate", handler.ValidateMCPServer(ctx))
+		mcp.POST("/:serverId/publish", handler.PublishMCPServer(ctx))
+		mcp.GET("/:serverId/tools", handler.ListMCPTools(ctx))
+		mcp.POST("/:serverId/tools", handler.CreateMCPTool(ctx))
+		mcp.GET("/:serverId/tools/:toolId", handler.GetMCPTool(ctx))
+		mcp.PUT("/:serverId/tools/:toolId", handler.UpdateMCPTool(ctx))
+		mcp.DELETE("/:serverId/tools/:toolId", handler.DeleteMCPTool(ctx))
+		mcp.POST("/:serverId/tools/:toolId/validate", handler.ValidateMCPTool(ctx))
+		mcp.GET("/:serverId/credentials", handler.ListMCPCredentials(ctx))
+		mcp.POST("/:serverId/credentials", handler.CreateMCPCredential(ctx))
+		mcp.DELETE("/:serverId/credentials/:credentialId", handler.RevokeMCPCredential(ctx))
+	}
+
 	router.GET("/prometheus", handler.GetPrometheus(ctx))
 	router.GET("/search", handler.BannerGlobalSearch(ctx))
 	router.GET("/overview", handler.ClusterOverview(ctx))
