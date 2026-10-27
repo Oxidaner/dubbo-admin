@@ -36,6 +36,7 @@ import (
 	meshresource "github.com/apache/dubbo-admin/pkg/core/resource/apis/mesh/v1alpha1"
 	coremodel "github.com/apache/dubbo-admin/pkg/core/resource/model"
 	"github.com/apache/dubbo-admin/pkg/core/store"
+	"github.com/apache/dubbo-admin/pkg/core/versioning"
 	"github.com/apache/dubbo-admin/pkg/store/memory"
 )
 
@@ -78,6 +79,10 @@ func (*mcpServiceTestContext) AppContext() stdctx.Context {
 }
 
 func (*mcpServiceTestContext) LockManager() lock.Lock {
+	return nil
+}
+
+func (*mcpServiceTestContext) RuleVersioning() *versioning.Service {
 	return nil
 }
 
