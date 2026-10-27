@@ -66,6 +66,18 @@ type ConditionalResourceStore interface {
 	CompareAndDelete(obj model.Resource, expectedVersion string) error
 }
 
+// CascadingResourceStore removes a versioned parent and its indexed dependent
+// resources as one store mutation. Both stores must use the same backend.
+type CascadingResourceStore interface {
+	CompareAndDeleteWithDependents(obj model.Resource, expectedVersion string, dependents ResourceStore, conditions []index.IndexCondition) error
+}
+
+// DependentResourceStore creates a child only while its parent exists. This
+// serializes credential creation with a server's cascading deletion.
+type DependentResourceStore interface {
+	AddWithParent(parent model.Resource, parentStore ResourceStore, child model.Resource) error
+}
+
 func IsVersionedResourceKind(kind model.ResourceKind) bool {
 	newResource, err := model.ResourceSchemaRegistry().NewResourceFunc(kind)
 	if err != nil {

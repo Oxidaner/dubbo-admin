@@ -46,6 +46,8 @@ type resourceStore struct {
 
 var _ store.ManagedResourceStore = &resourceStore{}
 var _ store.ConditionalResourceStore = &resourceStore{}
+var _ store.CascadingResourceStore = &resourceStore{}
+var _ store.DependentResourceStore = &resourceStore{}
 
 func copyVersionedResource(obj interface{}) interface{} {
 	if resource, ok := obj.(store.VersionedResource); ok {
@@ -98,6 +100,31 @@ func (rs *resourceStore) Add(obj interface{}) error {
 		return nil
 	}
 	return rs.add(obj)
+}
+
+func (rs *resourceStore) AddWithParent(parent coremodel.Resource, parentStore store.ResourceStore, child coremodel.Resource) error {
+	serverStore, ok := parentStore.(*resourceStore)
+	if !ok || serverStore == rs || child.ResourceKind() != rs.rk || parent.ResourceKind() != serverStore.rk {
+		return &store.PreconditionError{Reason: "parent and dependent must use distinct memory stores of the expected kinds"}
+	}
+	serverStore.mutationMu.Lock()
+	defer serverStore.mutationMu.Unlock()
+	rs.mutationMu.Lock()
+	defer rs.mutationMu.Unlock()
+	if _, exists, err := serverStore.storeProxy.GetByKey(parent.ResourceKey()); err != nil {
+		return err
+	} else if !exists {
+		return store.ErrorResourceNotFound(parent.ResourceKind().ToString(), parent.ResourceMeta().Name, parent.ResourceMesh())
+	}
+	candidate := child.DeepCopyObject().(coremodel.Resource)
+	if err := store.PrepareInitialVersion(candidate); err != nil {
+		return err
+	}
+	if err := rs.add(candidate); err != nil {
+		return err
+	}
+	child.(store.VersionedResource).SetResourceVersion(candidate.ResourceMeta().ResourceVersion)
+	return nil
 }
 
 func (rs *resourceStore) add(obj interface{}) error {
@@ -280,6 +307,48 @@ func (rs *resourceStore) CompareAndDelete(obj coremodel.Resource, expectedVersio
 	}
 	if _, err := store.NextResourceVersion(obj, expectedVersion); err != nil {
 		return err
+	}
+	return rs.delete(current)
+}
+
+func (rs *resourceStore) CompareAndDeleteWithDependents(obj coremodel.Resource, expectedVersion string, dependents store.ResourceStore, conditions []index.IndexCondition) error {
+	dependentStore, ok := dependents.(*resourceStore)
+	if !ok || dependentStore == rs {
+		return &store.PreconditionError{Reason: "dependent store must be a distinct memory store"}
+	}
+	rs.mutationMu.Lock()
+	defer rs.mutationMu.Unlock()
+	dependentStore.mutationMu.Lock()
+	defer dependentStore.mutationMu.Unlock()
+
+	currentObj, exists, err := rs.storeProxy.GetByKey(obj.ResourceKey())
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return store.ErrorResourceNotFound(obj.ResourceKind().ToString(), obj.ResourceMeta().Name, obj.ResourceMesh())
+	}
+	current := currentObj.(coremodel.Resource)
+	if current.ResourceMeta().ResourceVersion != expectedVersion {
+		return store.ErrorResourceConflict(obj.ResourceKind().ToString(), obj.ResourceMeta().Name, obj.ResourceMesh())
+	}
+	if _, err := store.NextResourceVersion(obj, expectedVersion); err != nil {
+		return err
+	}
+	keys, err := dependentStore.getKeysByIndexes(conditions)
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		item, found, err := dependentStore.storeProxy.GetByKey(key)
+		if err != nil {
+			return err
+		}
+		if found {
+			if err := dependentStore.delete(item); err != nil {
+				return err
+			}
+		}
 	}
 	return rs.delete(current)
 }
